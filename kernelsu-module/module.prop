@@ -1,0 +1,6 @@
+id=clashctl-kernelsu
+name=clashctl KernelSU
+version=v0.1.0
+versionCode=1
+author=Fahaxikiii
+description=KernelSU branch for clashctl on Android arm64. Downloads mihomo or uses a pre-specified URL at installation time.

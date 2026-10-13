@@ -1,211 +1,182 @@
-#!/system/bin/sh
-set -eu
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
-MODDIR=${0%/*}
-CLASHCTL_HOME="${CLASHCTL_HOME:-/data/adb/modules/clashctl}"
-BIN="$CLASHCTL_HOME/system/bin/mihomo"
-CONFIG_DIR="$CLASHCTL_HOME/data/config"
-LOG_DIR="$CLASHCTL_HOME/data/logs"
-PIDFILE="$CLASHCTL_HOME/data/clash.pid"
-LOGFILE="$LOG_DIR/clash.log"
-CONFIG_FILE="$CONFIG_DIR/config.yaml"
-SUBFILE="$CLASHCTL_HOME/data/subscriptions.txt"
+MODDIR = os.environ.get("CLASHCTL_HOME", "/data/adb/modules/clashctl")
+ROOT = os.path.join(MODDIR, "system", "webroot")
+CLASHCTL = os.path.join(MODDIR, "system", "bin", "clashctl")
+SUB_REFRESH = os.path.join(MODDIR, "system", "bin", "sub-refresh.sh")
+DOWNLOAD_SUBCONVERTER = os.path.join(MODDIR, "system", "bin", "download-subconverter.sh")
 
-mkdir -p "$CONFIG_DIR" "$LOG_DIR"
-[ -f "$CONFIG_FILE" ] || cat > "$CONFIG_FILE" <<'YAML'
-port: 7890
-socks-port: 7891
-mixed-port: 7892
-allow-lan: true
-bind-address: '*'
-mode: rule
-log-level: warning
-external-controller: 127.0.0.1:9090
-external-dns: true
-YAML
 
-clashctl_help() {
-  cat <<'HELP'
-Usage: clashctl [start|stop|status|ui|sub|config|logs|version]
+def json_response(handler, payload, status=200):
+    body = json.dumps(payload).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
 
-  start       start mihomo in the background
-  stop        stop mihomo
-  status      show running state in JSON-ish format
-  ui          show panel address
-  sub add --use URL
-              add a subscription URL
-  sub list    list stored subscriptions
-  sub delete ID
-              remove a subscription
-  config show
-  config set KEY=VALUE
-              update a simple config key
-  logs [tail N]
-              print recent logs
-  version     show module and kernel version
-HELP
-}
 
-is_running() {
-  if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE" 2>/dev/null || true)
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-      return 0
-    fi
-  fi
-  return 1
-}
+def call_clashctl(args):
+    try:
+        proc = subprocess.run([CLASHCTL] + args, capture_output=True, text=True)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        return {
+            "ok": proc.returncode == 0,
+            "code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+    except Exception as exc:
+        return {"ok": False, "code": 1, "stdout": "", "stderr": str(exc)}
 
-run_start() {
-  if is_running; then
-    echo "running: $(cat "$PIDFILE")"
-    return 0
-  fi
-  [ -x "$BIN" ] || {
-    echo "mihomo binary not found: $BIN"
-    return 1
-  }
-  nohup "$BIN" -d "$CONFIG_DIR" -f "$CONFIG_FILE" >>"$LOGFILE" 2>&1 &
-  echo $! > "$PIDFILE"
-  sleep 1
-  echo "started: $(cat "$PIDFILE")"
-}
 
-run_stop() {
-  if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE" 2>/dev/null || true)
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-      kill "$PID" || true
-    fi
-    rm -f "$PIDFILE"
-  fi
-  echo "stopped"
-}
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
 
-run_status() {
-  if is_running; then
-    echo "running: $(cat "$PIDFILE")"
-  else
-    echo "stopped"
-  fi
-}
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
 
-run_ui() {
-  echo "http://127.0.0.1:9090/"
-}
+        if path == "/api/status":
+            data = call_clashctl(["status"])
+            json_response(self, {"status": data})
+            return
 
-run_sub() {
-  action=${1:-list}
-  shift || true
-  case "$action" in
-    add)
-      [ "$1" = "--use" ] || { echo "Usage: clashctl sub add --use URL"; return 1; }
-      URL=${2:-}
-      [ -n "$URL" ] || { echo "Missing subscription URL"; return 1; }
-      printf '%s\n' "$URL" >> "$SUBFILE"
-      echo "subscription added: $URL"
-      ;;
-    list)
-      if [ -f "$SUBFILE" ]; then
-        nl -ba "$SUBFILE" 2>/dev/null || cat "$SUBFILE"
-      else
-        echo "No subscriptions configured."
-      fi
-      ;;
-    delete)
-      ID=${1:-}
-      [ -n "$ID" ] || { echo "Usage: clashctl sub delete ID"; return 1; }
-      if [ -f "$SUBFILE" ]; then
-        tmp=$(mktemp)
-        awk -v id="$ID" 'NR != id' "$SUBFILE" > "$tmp" && mv "$tmp" "$SUBFILE"
-        echo "deleted subscription index: $ID"
-      else
-        echo "No subscriptions configured."
-      fi
-      ;;
-    *)
-      echo "Unsupported sub command: $action"
-      return 1
-      ;;
-  esac
-}
+        if path == "/api/ui":
+            json_response(self, {"url": "http://127.0.0.1:9090/"})
+            return
 
-run_config() {
-  action=${1:-show}
-  case "$action" in
-    show)
-      if [ -f "$CONFIG_FILE" ]; then
-        cat "$CONFIG_FILE"
-      else
-        echo "No config file found"
-      fi
-      ;;
-    set)
-      kv=${2:-}
-      [ -n "$kv" ] || { echo "Usage: clashctl config set KEY=VALUE"; return 1; }
-      key=${kv%%=*}
-      value=${kv#*=}
-      if grep -Eq "^${key}:" "$CONFIG_FILE"; then
-        sed -i "s#^${key}:.*#${key}: ${value}#" "$CONFIG_FILE"
-      else
-        printf '%s: %s\n' "$key" "$value" >> "$CONFIG_FILE"
-      fi
-      echo "updated config key: $key"
-      ;;
-    *)
-      echo "Unsupported config action: $action"
-      return 1
-      ;;
-  esac
-}
+        if path == "/api/version":
+            data = call_clashctl(["version"])
+            json_response(self, {"version": data})
+            return
 
-run_logs() {
-  tail -n "${1:-50}" "$LOGFILE" 2>/dev/null || echo "No logs yet"
-}
+        if path == "/api/subscriptions":
+            result = call_clashctl(["sub", "list"])
+            json_response(self, {"subscriptions": result})
+            return
 
-run_version() {
-  echo "clashctl-kernelsu v0.1.0"
-}
+        if path == "/api/logs":
+            result = call_clashctl(["logs", "50"])
+            json_response(self, {"logs": result})
+            return
 
-case "${1:-help}" in
-  start)
-    run_start
-    ;;
-  on)
-    run_start
-    ;;
-  stop)
-    run_stop
-    ;;
-  off)
-    run_stop
-    ;;
-  status)
-    run_status
-    ;;
-  ui)
-    run_ui
-    ;;
-  sub)
-    shift
-    run_sub "$@"
-    ;;
-  config)
-    shift
-    run_config "$@"
-    ;;
-  logs)
-    shift
-    run_logs "$@"
-    ;;
-  version)
-    run_version
-    ;;
-  help|-h|--help)
-    clashctl_help
-    ;;
-  *)
-    clashctl_help
-    exit 1
-    ;;
-esac
+        if path == "/api/config":
+            result = call_clashctl(["config", "show"])
+            json_response(self, {"config": result})
+            return
+
+        # static files
+        if path in ("/", ""):
+            path = "/index.html"
+        safe_path = os.path.normpath(path).lstrip("/")
+        abs_path = os.path.join(ROOT, safe_path)
+        if os.path.isfile(abs_path):
+            with open(abs_path, "rb") as fp:
+                data = fp.read()
+            self.send_response(200)
+            if abs_path.endswith(".html"):
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+            elif abs_path.endswith(".js"):
+                self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            elif abs_path.endswith(".css"):
+                self.send_header("Content-Type", "text/css; charset=utf-8")
+            else:
+                self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        json_response(self, {"error": "Not found"}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8", errors="ignore")
+
+        if path == "/api/start":
+            json_response(self, call_clashctl(["start"]))
+            return
+
+        if path == "/api/stop":
+            json_response(self, call_clashctl(["stop"]))
+            return
+
+        if path == "/api/refresh":
+            # trigger a one-shot subscription refresh
+            if os.path.isfile(SUB_REFRESH) and os.access(SUB_REFRESH, os.X_OK):
+                proc = subprocess.run([SUB_REFRESH], capture_output=True, text=True)
+                json_response(self, {"refresh": {"ok": proc.returncode==0, "stdout": proc.stdout, "stderr": proc.stderr}})
+            else:
+                json_response(self, {"error": "sub-refresh script not available"}, 500)
+            return
+
+        if path == "/api/download-subconverter":
+            if os.path.isfile(DOWNLOAD_SUBCONVERTER) and os.access(DOWNLOAD_SUBCONVERTER, os.X_OK):
+                proc = subprocess.run([DOWNLOAD_SUBCONVERTER], capture_output=True, text=True, shell=False)
+                json_response(self, {"download": {"ok": proc.returncode==0, "stdout": proc.stdout, "stderr": proc.stderr}})
+            else:
+                json_response(self, {"error": "download-subconverter script not available"}, 500)
+            return
+
+        if path == "/api/upgrade":
+            json_response(self, call_clashctl(["upgrade"]))
+            return
+
+        if path == "/api/update":
+            json_response(self, call_clashctl(["update"]))
+            return
+
+        if path == "/api/subscriptions":
+            try:
+                payload = json.loads(body) if body else {}
+            except Exception:
+                payload = {}
+            url = payload.get("url") or payload.get("URL")
+            if not url:
+                json_response(self, {"error": "Missing url"}, 400)
+                return
+            result = call_clashctl(["sub", "add", "--use", str(url)])
+            json_response(self, {"result": result})
+            return
+
+        if path == "/api/config":
+            try:
+                payload = json.loads(body) if body else {}
+            except Exception:
+                payload = {}
+            key = payload.get("key")
+            value = payload.get("value")
+            if key and value is not None:
+                result = call_clashctl(["config", "set", f"{key}={value}"])
+                json_response(self, {"result": result})
+                return
+            json_response(self, {"error": "Missing key/value"}, 400)
+            return
+
+        json_response(self, {"error": "Unsupported POST endpoint"}, 404)
+
+
+def main():
+    port = int(os.environ.get("PORT", "9090"))
+    host = os.environ.get("HOST", "127.0.0.1")
+    try:
+        httpd = ThreadingHTTPServer((host, port), Handler)
+        print(f"webroot listening on http://{host}:{port}/")
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

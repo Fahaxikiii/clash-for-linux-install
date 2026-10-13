@@ -1,23 +1,26 @@
 #!/system/bin/sh
 set -eu
 
-MODDIR="${CLASHCTL_HOME:-/data/adb/modules/clashctl}"
-PYTHON_BIN=""
-for py in python3 python; do
-  if command -v "$py" >/dev/null 2>&1; then
-    PYTHON_BIN="$py"
-    break
+# Start module services: mihomo, webroot, sub-refresh
+MODDIR=${0%/*}
+CLASHCTL_HOME="${CLASHCTL_HOME:-/data/adb/modules/clashctl}"
+
+# start mihomo via clashctl
+if [ -x "$CLASHCTL_HOME/system/bin/clashctl" ]; then
+  "$CLASHCTL_HOME/system/bin/clashctl" start || true
+fi
+
+# start web UI
+if [ -x "$CLASHCTL_HOME/system/bin/webroot_launcher.sh" ]; then
+  "$CLASHCTL_HOME/system/bin/webroot_launcher.sh" >/dev/null 2>&1 &
+  echo $! > "$CLASHCTL_HOME/data/webroot.pid"
+fi
+
+# start subscription refresh loop if SUB_REFRESH_LOOP is enabled
+if [ "${SUB_REFRESH_LOOP:-1}" != "0" ]; then
+  if [ -x "$CLASHCTL_HOME/system/bin/sub-refresh-start.sh" ]; then
+    "$CLASHCTL_HOME/system/bin/sub-refresh-start.sh" >/dev/null 2>&1 || true
   fi
-done
-
-if [ -n "$PYTHON_BIN" ]; then
-  exec "$PYTHON_BIN" "$MODDIR/system/bin/webroot.py"
 fi
 
-if command -v busybox >/dev/null 2>&1; then
-  echo "Python not found; falling back to busybox httpd static mode."
-  exec busybox httpd -f -p 9090 -h "$MODDIR/system/webroot"
-fi
-
-echo "This module needs python3 or busybox httpd to serve the web UI."
-exit 1
+echo "module services started"
